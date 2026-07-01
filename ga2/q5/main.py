@@ -8,7 +8,7 @@ from typing import List
 
 
 API_KEY = "ak_lp8kury0lvzageanyfigjiir"
-EMAIL = os.getenv("EMAIL", "your-email@example.com")
+EMAIL = os.getenv("EMAIL", "24f1002157@ds.study.iitm.ac.in")
 
 app = FastAPI()
 
