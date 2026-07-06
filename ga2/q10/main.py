@@ -9,8 +9,7 @@ app = FastAPI()
 
 EMAIL = "24f1002157@ds.study.iitm.ac.in"
 ALLOWED_ORIGINS = [
-    "https://app-f7o01f.example.com",
-    # add the exam page origin here if your grader browser needs it
+    "https://exam.sanand.workers.dev"
 ]
 
 RATE_LIMIT = 14
