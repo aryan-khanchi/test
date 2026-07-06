@@ -9,6 +9,7 @@ app = FastAPI()
 
 EMAIL = "24f1002157@ds.study.iitm.ac.in"
 ALLOWED_ORIGINS = [
+    "https://app-f7o01f.example.com",
     "https://exam.sanand.workers.dev"
 ]
 
