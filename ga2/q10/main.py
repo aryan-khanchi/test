@@ -48,6 +48,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -56,8 +57,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Request-ID"],
+    max_age=600,
 )
-app.add_middleware(RateLimitMiddleware)
 
 
 @app.get("/ping")
