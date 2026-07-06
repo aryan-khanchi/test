@@ -94,6 +94,10 @@ def list_orders(
         "next_cursor": next_cursor,
     }
 
+@app.get("/ping")
+def ping():
+    return {"ping": "pong"}
+
 @app.get("/")
 def root():
     return {"message": "orders api is running"}
