@@ -77,8 +77,8 @@ def merge_layer(base: dict, layer: dict):
 async def effective_config(request: Request, set: List[str] = Query(default=[])):
     config = dict(DEFAULTS)
 
-    config = merge_layer(config, load_dotenv_layer())
     config = merge_layer(config, load_yaml_layer())
+    config = merge_layer(config, load_dotenv_layer())
     config = merge_layer(config, load_os_env_layer())
 
     for item in set:
