@@ -1,58 +1,100 @@
 import os
+import re
 import base64
 import binascii
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from openai import OpenAI
 
-app = FastAPI()
+app = Flask(__name__)
+CORS(app)  # allow all origins so the grader's Cloudflare Worker can call this
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+SYSTEM_PROMPT = (
+    "You are a precise document/chart/table reading assistant. "
+    "You will be given an image (a scanned document, receipt, invoice, table, "
+    "or chart) and a question about it. "
+    "Read the image carefully and answer the question. "
+    "Rules for your answer:\n"
+    "1. Reply with ONLY the answer value, nothing else — no explanation, "
+    "no restated question, no extra words.\n"
+    "2. If the answer is numeric, return ONLY the number "
+    "(e.g. '4089.35'), with no currency symbols, commas, units, or %.\n"
+    "3. If the answer is text, return the exact text/label as it appears.\n"
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-class AnswerRequest(BaseModel):
-    image_base64: str
-    question: str
+def normalize_numeric(text: str) -> str:
+    """If the answer is basically a number, strip stray currency/unit junk."""
+    stripped = text.strip()
+    match = re.fullmatch(r"[^\d\-]*(-?\d[\d,]*\.?\d*)[^\d]*", stripped)
+    if match:
+        return match.group(1).replace(",", "")
+    return stripped
 
-def to_data_url(image_b64: str) -> str:
-    s = image_b64.strip().replace("\n", "").replace(" ", "")
-    if s.startswith("data:"):
-        header, b64part = s.split(",", 1)
-        base64.b64decode(b64part, validate=True)
-        return s
-    base64.b64decode(s, validate=True)
-    return f"data:image/png;base64,{s}"
 
-@app.post("/answer-image")
-def answer_image(req: AnswerRequest):
+def guess_mime(image_bytes: bytes) -> str:
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if image_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"  # sane default
+
+
+@app.route("/answer-image", methods=["POST"])
+def answer_image():
+    data = request.get_json(silent=True) or {}
+    image_b64 = data.get("image_base64")
+    question = data.get("question")
+
+    if not image_b64 or not question:
+        return jsonify({"answer": ""}), 400
+
+    # Strip a data URL prefix if the client sent one anyway
+    if "," in image_b64 and image_b64.strip().lower().startswith("data:"):
+        image_b64 = image_b64.split(",", 1)[1]
+
     try:
-        data_url = to_data_url(req.image_base64)
+        image_bytes = base64.b64decode(image_b64, validate=False)
+    except (binascii.Error, ValueError):
+        return jsonify({"answer": ""}), 400
 
-        response = client.responses.create(
-            model="gpt-4.1",
-            input=[
+    mime = guess_mime(image_bytes)
+    data_url = f"data:{mime};base64,{image_b64}"
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": req.question},
-                        {"type": "input_image", "image_url": data_url},
+                        {"type": "text", "text": question},
+                        {"type": "image_url", "image_url": {"url": data_url}},
                     ],
-                }
+                },
             ],
         )
-
-        answer = (response.output_text or "").strip()
-        return {"answer": str(answer) if answer else "Unable to read the image"}
-
-    except binascii.Error:
-        raise HTTPException(status_code=400, detail="Invalid base64 image")
+        raw_answer = response.choices[0].message.content.strip()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model error: {str(e)}")
+        return jsonify({"answer": "", "error": str(e)}), 500
+
+    final_answer = normalize_numeric(raw_answer)
+    return jsonify({"answer": final_answer})
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
