@@ -1,5 +1,6 @@
 import os
 import base64
+import binascii
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,20 +22,20 @@ class AnswerRequest(BaseModel):
     image_base64: str
     question: str
 
-def make_data_url(image_b64: str) -> str:
-    s = image_b64.strip()
+def to_data_url(image_b64: str) -> str:
+    s = image_b64.strip().replace("\n", "").replace(" ", "")
     if s.startswith("data:"):
+        header, b64part = s.split(",", 1)
+        base64.b64decode(b64part, validate=True)
         return s
+    base64.b64decode(s, validate=True)
     return f"data:image/png;base64,{s}"
 
 @app.post("/answer-image")
 def answer_image(req: AnswerRequest):
-    if not req.image_base64 or not req.question:
-        raise HTTPException(status_code=400, detail="Missing image_base64 or question")
-
-    data_url = make_data_url(req.image_base64)
-
     try:
+        data_url = to_data_url(req.image_base64)
+
         response = client.responses.create(
             model="gpt-4.1",
             input=[
@@ -49,10 +50,9 @@ def answer_image(req: AnswerRequest):
         )
 
         answer = (response.output_text or "").strip()
-        if not answer:
-            answer = "Unable to read the image"
+        return {"answer": str(answer) if answer else "Unable to read the image"}
 
-        return {"answer": str(answer)}
-
+    except binascii.Error:
+        raise HTTPException(status_code=400, detail="Invalid base64 image")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model error: {str(e)}")
