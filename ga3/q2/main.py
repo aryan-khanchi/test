@@ -2,15 +2,20 @@ import os
 import re
 import base64
 import binascii
+import logging
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from openai import OpenAI
+from google import genai
+from google.genai import types
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)  # allow all origins so the grader's Cloudflare Worker can call this
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 SYSTEM_PROMPT = (
     "You are a precise document/chart/table reading assistant. "
@@ -66,25 +71,19 @@ def answer_image():
         return jsonify({"answer": ""}), 400
 
     mime = guess_mime(image_bytes)
-    data_url = f"data:{mime};base64,{image_b64}"
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": question},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                },
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type=mime),
+                f"{SYSTEM_PROMPT}\n\nQuestion: {question}",
             ],
+            config=types.GenerateContentConfig(temperature=0),
         )
-        raw_answer = response.choices[0].message.content.strip()
+        raw_answer = response.text.strip()
     except Exception as e:
+        logger.exception("Gemini call failed")
         return jsonify({"answer": "", "error": str(e)}), 500
 
     final_answer = normalize_numeric(raw_answer)
