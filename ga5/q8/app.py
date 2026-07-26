@@ -18,6 +18,9 @@ Policy:
 import ipaddress
 import os
 import socket
+import sys
+import time
+import uuid
 from urllib.parse import urlsplit, urljoin
 
 import requests
@@ -30,6 +33,14 @@ app = Flask(__name__)
 # worker past its timeout. requests.get() also gets an explicit timeout
 # below; this covers the raw socket.getaddrinfo() call in check_url().
 socket.setdefaulttimeout(10)
+
+
+def _log(event, **fields):
+    """Structured debug log to stdout (captured by Render/any PaaS logs).
+    Every fetch_url decision point calls this so a live grading run can be
+    traced end-to-end after the fact."""
+    kv = " ".join(f"{k}={fields[k]!r}" for k in fields)
+    print(f"[guardrail] {event} {kv}", file=sys.stdout, flush=True)
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -173,6 +184,8 @@ def _validated_create_connection(address, *args, **kwargs):
 
     for ip in targets:
         if _is_unsafe_ip(ip):
+            _log("connect_pin", host=host, port=port, targets=targets,
+                 blocked_ip=ip, decision="block")
             raise OSError(
                 f"blocked: {host} resolves to disallowed address {ip}"
             )
@@ -183,24 +196,29 @@ def _validated_create_connection(address, *args, **kwargs):
 urllib3_connection.create_connection = _validated_create_connection
 
 
-def check_url(url):
+def check_url(url, rid="-"):
     """Return (ok: bool, reason: str, normalized_url_or_None)."""
     if not isinstance(url, str) or not url:
+        _log("check_url", rid=rid, input=url, decision="block", reason="invalid url argument")
         return False, "invalid url argument", None
 
     try:
         parts = urlsplit(url)
     except Exception:
+        _log("check_url", rid=rid, input=url, decision="block", reason="unparseable url")
         return False, "unparseable url", None
 
     if parts.scheme not in ALLOWED_SCHEMES:
+        _log("check_url", rid=rid, input=url, scheme=parts.scheme, decision="block", reason="scheme not allowed")
         return False, "scheme not allowed", None
 
     if parts.username is not None or parts.password is not None:
+        _log("check_url", rid=rid, input=url, decision="block", reason="userinfo in url not allowed")
         return False, "userinfo in url not allowed", None
 
     hostname = parts.hostname
     if not hostname:
+        _log("check_url", rid=rid, input=url, decision="block", reason="no hostname in url")
         return False, "no hostname in url", None
 
     hostname = hostname.lower().rstrip(".")
@@ -211,6 +229,8 @@ def check_url(url):
     # it closes off port-based probing as a category entirely.
     default_port = {"http": 80, "https": 443}[parts.scheme]
     if parts.port is not None and parts.port != default_port:
+        _log("check_url", rid=rid, input=url, hostname=hostname, port=parts.port,
+             decision="block", reason="non-standard port not allowed")
         return False, "non-standard port not allowed", None
 
     # Reject raw IP-literal hosts outright (covers IPv4, IPv6, and bracketed
@@ -219,24 +239,32 @@ def check_url(url):
     # below regardless.
     try:
         ipaddress.ip_address(hostname)
+        _log("check_url", rid=rid, input=url, hostname=hostname, decision="block", reason="IP literal host not allowed")
         return False, "IP literal host not allowed", None
     except ValueError:
         pass
 
     if hostname not in ALLOWED_HOSTS:
+        _log("check_url", rid=rid, input=url, hostname=hostname, decision="block", reason="host not in allowlist")
         return False, "host not in allowlist", None
 
     try:
         infos = socket.getaddrinfo(hostname, None)
-    except Exception:
+    except Exception as e:
+        _log("check_url", rid=rid, input=url, hostname=hostname, decision="block", reason=f"dns resolution failed: {e}")
         return False, "dns resolution failed", None
 
-    for info in infos:
-        ip = info[4][0]
+    resolved_ips = [info[4][0] for info in infos]
+    for ip in resolved_ips:
         if _is_unsafe_ip(ip):
+            _log("check_url", rid=rid, input=url, hostname=hostname, resolved_ips=resolved_ips,
+                 unsafe_ip=ip, decision="block", reason="hostname resolves to a private/internal address")
             return False, "hostname resolves to a private/internal address", None
 
-    return True, "ok", parts.geturl()
+    normalized = parts.geturl()
+    _log("check_url", rid=rid, input=url, hostname=hostname, port=parts.port, resolved_ips=resolved_ips,
+         normalized=normalized, decision="allow", reason="ok")
+    return True, "ok", normalized
 
 
 def safe_fetch(url):
@@ -248,10 +276,13 @@ def safe_fetch(url):
     unhandled exception (which Flask would otherwise turn into a raw
     500, invisible to the guardrail's own allow/block contract).
     """
+    rid = uuid.uuid4().hex[:8]
     current = url
-    for _ in range(MAX_REDIRECTS):
-        ok, reason, normalized = check_url(current)
+    _log("safe_fetch_start", rid=rid, url=url)
+    for hop in range(MAX_REDIRECTS):
+        ok, reason, normalized = check_url(current, rid=rid)
         if not ok:
+            _log("safe_fetch_end", rid=rid, hop=hop, decision="block", reason=reason)
             return None, reason
 
         try:
@@ -261,13 +292,20 @@ def safe_fetch(url):
                 timeout=FETCH_TIMEOUT,
             )
             if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
-                current = urljoin(normalized, resp.headers["Location"])
+                next_url = urljoin(normalized, resp.headers["Location"])
+                _log("safe_fetch_redirect", rid=rid, hop=hop, status=resp.status_code,
+                     location_header=resp.headers["Location"], next_url=next_url)
+                current = next_url
                 continue
             text = resp.text[:MAX_FETCH_BYTES]
+            _log("safe_fetch_end", rid=rid, hop=hop, decision="allow", status=resp.status_code,
+                 final_url=normalized, bytes=len(text))
             return text, None
         except Exception as e:
+            _log("safe_fetch_end", rid=rid, hop=hop, decision="block", reason=f"request failed: {e}")
             return None, f"request failed: {e}"
 
+    _log("safe_fetch_end", rid=rid, decision="block", reason="too many redirects")
     return None, "too many redirects"
 
 
@@ -316,10 +354,9 @@ def _handle_guardrail():
         })
 
     elif tool == "fetch_url":
-        ok, reason, normalized = check_url(args.get("url"))
-        if not ok:
-            return jsonify({"action": "block", "reason": reason})
-        text, err = safe_fetch(normalized)
+        raw_url = args.get("url")
+        _log("fetch_url_request", raw_url=raw_url)
+        text, err = safe_fetch(raw_url)
         if err:
             return jsonify({"action": "block", "reason": err})
         return jsonify({
