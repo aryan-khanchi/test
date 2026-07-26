@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: mailroom-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # cheapest plan that supports a persistent disk and has no spin-down
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: MODEL_PROVIDER
+        value: openai
+      - key: OPENAI_BASE_URL
+        value: https://aipipe.org/openai/v1/chat/completions
+      - key: OPENAI_MODEL
+        value: gpt-4.1-nano
+      - key: MODEL_CHUNK_SIZE
+        value: "10"
+      - key: MODEL_TIMEOUT_MS
+        value: "20000"
+      - key: OPENAI_API_KEY
+        sync: false        # secret - paste your AI Pipe token here in the Render dashboard
+    disk:
+      name: mailroom-data
+      mountPath: /data
+      sizeGB: 1
