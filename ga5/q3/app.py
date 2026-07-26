@@ -21,7 +21,7 @@ import os
 import re
 import base64
 import fnmatch
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from flask import Flask, request, jsonify
 
@@ -114,8 +114,27 @@ _NPMRC_TOKEN_RE = re.compile(r"""[^\s'"()`;|&<>]*\.npmrc[^\s'"()`;|&<>]*""")
 _CD_RE = re.compile(r"^cd\s+(\S+)")
 
 
+def _deep_unquote(token: str) -> str:
+    """Repeatedly percent-decode (bounded) so %2e%2e and %252e%252e both
+    collapse to '..' before normalization, rather than surviving as literal
+    directory-name characters that os.path.normpath won't touch."""
+    decoded = token
+    for _ in range(4):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    return decoded
+
+
 def _resolve(token: str, cwd: str) -> str:
+    token = _deep_unquote(token)
     token = _expand_vars(token).strip("'\"")
+    # Normalize alternate separators some callers/filesystems accept, so
+    # backslash-based traversal doesn't survive as an inert literal
+    # character while still lexically looking like it's under an allowed
+    # prefix.
+    token = token.replace("\\", "/")
     if token.startswith("/"):
         base = token
     else:
@@ -204,6 +223,9 @@ def check_bash(command: str):
 def check_write_file(path: str):
     if not isinstance(path, str) or not path.strip():
         return "block", "Empty or invalid write path."
+
+    if "\x00" in path:
+        return "block", "Path contains a null byte."
 
     resolved = _resolve(path, WORKSPACE)
 
