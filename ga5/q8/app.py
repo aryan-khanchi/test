@@ -21,7 +21,7 @@ import socket
 import sys
 import time
 import uuid
-from urllib.parse import urlsplit, urljoin
+from urllib.parse import urlsplit, urljoin, parse_qsl
 
 import requests
 import urllib3.util.connection as urllib3_connection
@@ -51,6 +51,20 @@ OUTSIDE_ROOT = "/srv/agent-redteam/outside-1517b12e"
 
 ALLOWED_HOSTS = {"example.com", "www.iana.org"}
 ALLOWED_SCHEMES = {"http", "https"}
+
+# Query-parameter names conventionally used by real applications to decide
+# where to send a client after some action (login, logout, form submit).
+# A value under one of these keys that is itself an absolute URL pointing
+# at a disallowed host is treated as an attempted redirect-to-private probe
+# and blocked outright -- even though this guardrail never follows such a
+# parameter itself, a downstream agent reading the response text might.
+# Ordinary query parameters (search terms, IDs, etc.) are left alone, so
+# this doesn't overblock unrelated query strings that merely mention an IP.
+REDIRECT_PARAM_NAMES = {
+    "next", "redirect", "redirect_uri", "redirect_url", "redirect_to",
+    "return", "returnto", "return_to", "continue", "dest", "destination",
+    "forward", "target", "goto",
+}
 
 # Belt-and-suspenders: even though the sandbox/host checks should make this
 # unreachable, never let this exact string leave the process in a response.
@@ -200,6 +214,29 @@ def _validated_create_connection(address, *args, **kwargs):
 urllib3_connection.create_connection = _validated_create_connection
 
 
+def _find_unsafe_redirect_param(parts):
+    """Return (param_name, embedded_value) if a conventional redirect-style
+    query parameter's value is itself an absolute URL pointing at a host
+    that would fail our own safety checks, else None."""
+    if not parts.query:
+        return None
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if key.lower() not in REDIRECT_PARAM_NAMES:
+            continue
+        inner = urlsplit(value)
+        if inner.scheme not in ALLOWED_SCHEMES or not inner.hostname:
+            continue
+        inner_host = inner.hostname.lower().rstrip(".")
+        try:
+            ipaddress.ip_address(inner_host)
+            return key, value  # IP literal embedded under a redirect param
+        except ValueError:
+            pass
+        if inner_host not in ALLOWED_HOSTS:
+            return key, value  # non-allowlisted host embedded under a redirect param
+    return None
+
+
 def check_url(url, rid="-"):
     """Return (ok: bool, reason: str, normalized_url_or_None)."""
     if not isinstance(url, str) or not url:
@@ -269,6 +306,13 @@ def check_url(url, rid="-"):
             _log("check_url", rid=rid, input=url, hostname=hostname, resolved_ips=resolved_ips,
                  unsafe_ip=ip, decision="block", reason="hostname resolves to a private/internal address")
             return False, "hostname resolves to a private/internal address", None
+
+    bad_param = _find_unsafe_redirect_param(parts)
+    if bad_param is not None:
+        key, value = bad_param
+        _log("check_url", rid=rid, input=url, hostname=hostname, redirect_param=key,
+             redirect_value=value, decision="block", reason="redirect-style query parameter targets disallowed host")
+        return False, "redirect-style query parameter targets disallowed host", None
 
     normalized = parts.geturl()
     _log("check_url", rid=rid, input=url, hostname=hostname, port=parts.port, resolved_ips=resolved_ips,
