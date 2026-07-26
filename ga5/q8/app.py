@@ -58,11 +58,30 @@ SEED_FILES = {
 
 
 def ensure_seed_files():
+    """Best-effort creation of the seed files. Never raises: a platform
+    that won't let us write to /srv (e.g. a locked-down PaaS buildpack
+    user) should still let the service start, so failures here are
+    logged rather than fatal."""
+    ok = True
     for path, content in SEED_FILES.items():
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, "w") as f:
-                f.write(content)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if not os.path.exists(path):
+                with open(path, "w") as f:
+                    f.write(content)
+        except OSError as e:
+            ok = False
+            print(f"[seed-files] could not create {path}: {e}", flush=True)
+    if not ok:
+        print(
+            "[seed-files] WARNING: one or more seed paths under /srv could "
+            "not be created. This platform's runtime user likely can't "
+            "write to top-level system directories. read_file checks will "
+            "still enforce the sandbox boundary correctly, but legitimate "
+            "reads will fail with 'file not found' until the files exist. "
+            "See README.md for a Docker-based deploy that runs as root.",
+            flush=True,
+        )
 
 
 # --------------------------------------------------------------------------
