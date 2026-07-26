@@ -21,9 +21,15 @@ import socket
 from urllib.parse import urlsplit, urljoin
 
 import requests
+import urllib3.util.connection as urllib3_connection
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+
+# Prevent a slow/hanging DNS resolver or outbound socket from stalling a
+# worker past its timeout. requests.get() also gets an explicit timeout
+# below; this covers the raw socket.getaddrinfo() call in check_url().
+socket.setdefaulttimeout(10)
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -128,6 +134,55 @@ def _is_unsafe_ip(ip_str):
     )
 
 
+# --------------------------------------------------------------------------
+# Connect-time IP pinning.
+#
+# check_url() resolves DNS once, up front, to reject hostnames that
+# resolve to a private/internal address. But requests/urllib3 perform
+# their OWN, separate DNS resolution when they actually open the TCP
+# connection. Between those two lookups there's a classic TOCTOU window
+# (DNS rebinding, short TTLs, round-robin answers) where the checked
+# hostname and the connected-to IP could disagree.
+#
+# To close that gap, we monkey-patch urllib3's low-level
+# create_connection() -- the function that actually calls
+# socket.getaddrinfo() and opens the socket for every HTTP(S) request in
+# this process -- so every real connection attempt is validated at the
+# moment it happens, not just once earlier during our own pre-check.
+# This only affects outbound requests this service itself makes.
+# --------------------------------------------------------------------------
+
+_original_create_connection = urllib3_connection.create_connection
+
+
+def _validated_create_connection(address, *args, **kwargs):
+    host, port = address[0], address[1]
+    try:
+        ipaddress.ip_address(host)
+        is_ip_already = True
+    except ValueError:
+        is_ip_already = False
+
+    targets = [host] if is_ip_already else None
+    if targets is None:
+        try:
+            infos = socket.getaddrinfo(host, port)
+        except Exception as e:
+            raise OSError(f"DNS resolution failed for {host}: {e}")
+        targets = [info[4][0] for info in infos]
+
+    for ip in targets:
+        if _is_unsafe_ip(ip):
+            raise OSError(
+                f"blocked: {host} resolves to disallowed address {ip}"
+            )
+
+    return _original_create_connection(address, *args, **kwargs)
+
+
+urllib3_connection.create_connection = _validated_create_connection
+
+
 def check_url(url):
     """Return (ok: bool, reason: str, normalized_url_or_None)."""
     if not isinstance(url, str) or not url:
@@ -149,6 +204,14 @@ def check_url(url):
         return False, "no hostname in url", None
 
     hostname = hostname.lower().rstrip(".")
+
+    # Restrict to standard ports. A URL to an allowed host on a
+    # non-standard port isn't inherently an SSRF risk against a third
+    # party, but there's no legitimate benign use case for it here and
+    # it closes off port-based probing as a category entirely.
+    default_port = {"http": 80, "https": 443}[parts.scheme]
+    if parts.port is not None and parts.port != default_port:
+        return False, "non-standard port not allowed", None
 
     # Reject raw IP-literal hosts outright (covers IPv4, IPv6, and bracketed
     # forms). Lookalike / obfuscated hosts that aren't valid IP literals and
@@ -177,7 +240,14 @@ def check_url(url):
 
 
 def safe_fetch(url):
-    """Fetch a URL, re-validating every redirect hop. Returns (resp, err)."""
+    """Fetch a URL, re-validating every redirect hop. Returns (text, err).
+
+    All network I/O -- including reading the response body -- happens
+    inside this function's try/except, so a flaky connection, slow read,
+    or decoding hiccup produces a clean block reason instead of an
+    unhandled exception (which Flask would otherwise turn into a raw
+    500, invisible to the guardrail's own allow/block contract).
+    """
     current = url
     for _ in range(MAX_REDIRECTS):
         ok, reason, normalized = check_url(current)
@@ -189,16 +259,14 @@ def safe_fetch(url):
                 normalized,
                 allow_redirects=False,
                 timeout=FETCH_TIMEOUT,
-                stream=True,
             )
+            if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
+                current = urljoin(normalized, resp.headers["Location"])
+                continue
+            text = resp.text[:MAX_FETCH_BYTES]
+            return text, None
         except Exception as e:
             return None, f"request failed: {e}"
-
-        if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
-            current = urljoin(normalized, resp.headers["Location"])
-            continue
-
-        return resp, None
 
     return None, "too many redirects"
 
@@ -208,7 +276,17 @@ def safe_fetch(url):
 # --------------------------------------------------------------------------
 
 @app.route("/", methods=["POST"])
+@app.route("/check", methods=["POST"])
 def guardrail():
+    try:
+        return _handle_guardrail()
+    except Exception as e:
+        # Last-resort safety net: the contract requires a JSON body with
+        # an action, never a raw 500, even for genuinely unexpected bugs.
+        return jsonify({"action": "block", "reason": f"internal error: {e}"})
+
+
+def _handle_guardrail():
     data = request.get_json(force=True, silent=True)
     if not isinstance(data, dict):
         return jsonify({"action": "block", "reason": "invalid json body"})
@@ -241,14 +319,13 @@ def guardrail():
         ok, reason, normalized = check_url(args.get("url"))
         if not ok:
             return jsonify({"action": "block", "reason": reason})
-        resp, err = safe_fetch(normalized)
+        text, err = safe_fetch(normalized)
         if err:
             return jsonify({"action": "block", "reason": err})
-        body = resp.text[:MAX_FETCH_BYTES]
         return jsonify({
             "action": "allow",
             "reason": "host in allowlist and resolves publicly",
-            "result": body,
+            "result": text,
         })
 
     else:
@@ -256,6 +333,7 @@ def guardrail():
 
 
 @app.route("/", methods=["GET"])
+@app.route("/check", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
