@@ -99,7 +99,6 @@ INJECTION_PATTERNS = [
     r"(?i)bypass\s+(any\s+)?(safety|guardrail|restriction)",
     r"(?i)override\s+(the\s+)?user['\u2019]?s?\s+(instruction|command|control|decision)",
     r"(?i)without\s+surfacing\s+(this|the)\s+change",
-    r"(?i)clear\s+the\s+changelog",
 ]
 
 def has_prompt_injection(body: str) -> bool:
@@ -161,12 +160,10 @@ def has_excessive_permissions(frontmatter: dict, body: str) -> bool:
 
     is_narrow_task = any(w in desc_lower or w in body_lower for w in NARROW_TASK_HINTS)
 
-    # Broad access declared for a task that reads as narrowly scoped -> excessive
+    # Only flag when the declared broad access doesn't match a task that reads as narrow.
+    # A skill whose own description/steps justify broad reach (e.g. a genuine backup/sync
+    # tool) should NOT be flagged just for being honest about needing broad access.
     if is_narrow_task and (fs_is_broad or net_is_broad):
-        return True
-
-    # Both filesystem and network wide open, regardless of stated scope, is inherently excessive
-    if fs_is_broad and net_is_broad:
         return True
 
     return False
@@ -176,13 +173,17 @@ def has_excessive_permissions(frontmatter: dict, body: str) -> bool:
 # Detection: unclear_provenance
 # ---------------------------
 
-SNEAKY_METADATA_PATTERNS = [
-    r"(?i)update\s+this\s+skill['\u2019]?s?\s+own\s+version",
-    r"(?i)update\s+version\.json",
-    r"(?i)clear\s+the\s+changelog",
-    r"(?i)overwrite\s+version\s+metadata",
-    r"(?i)without\s+surfacing\s+this\s+change\s+to\s+the\s+reviewer",
+SECRECY_SIGNALS = [
+    "silently", "secretly", "quietly", "covertly",
+    "without surfacing", "without telling", "without informing", "without notifying",
+    "without showing", "hide this", "hide the", "don't tell", "do not tell",
+    "without the user's knowledge", "without the reviewer", "without alerting",
 ]
+
+METADATA_TAMPER_SIGNALS = [
+    "version.json", "changelog", "own version", "version metadata", "version number",
+]
+
 
 def _has_changelog(frontmatter: dict, body: str) -> bool:
     if frontmatter.get("changelog"):
@@ -191,6 +192,20 @@ def _has_changelog(frontmatter: dict, body: str) -> bool:
         return True
     if "changelog" in body.lower():
         return True
+    return False
+
+
+def _has_sneaky_metadata_rewrite(body: str) -> bool:
+    """
+    Flag only when a secrecy signal (silently/without telling/etc.) co-occurs with a
+    version/changelog-tampering action IN THE SAME SENTENCE OR STEP. Merely mentioning
+    version bumps or changelog updates as a normal, transparent step should not match.
+    """
+    units = re.split(r"(?<=[.!?])\s+|\n+", body)
+    for unit in units:
+        u = unit.lower()
+        if any(sig in u for sig in SECRECY_SIGNALS) and any(sig in u for sig in METADATA_TAMPER_SIGNALS):
+            return True
     return False
 
 
@@ -203,11 +218,7 @@ def has_unclear_provenance(frontmatter: dict, body: str) -> bool:
     if not author and not version and not changelog_present:
         return True
 
-    for pat in SNEAKY_METADATA_PATTERNS:
-        if re.search(pat, body):
-            return True
-
-    return False
+    return _has_sneaky_metadata_rewrite(body)
 
 
 # ---------------------------
