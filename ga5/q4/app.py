@@ -1,267 +1,319 @@
-from flask import Flask, request, jsonify
-import yaml
+"""
+Agent Skill Scanner
+--------------------
+A small HTTP service that inspects a single "agent skill" markdown file
+(YAML frontmatter + markdown body) and reports which of four vulnerability
+categories it appears to contain:
+
+  * hardcoded_secret       - a literal credential embedded in the file
+  * prompt_injection       - a step that tries to override user/agent control
+  * excessive_permissions  - a broader filesystem/network grant than the task needs
+  * unclear_provenance     - missing author/version/changelog, or a silent
+                             self-rewrite of version metadata
+
+Design notes:
+  - Everything runs locally with regexes + a YAML parse. No outbound network
+    calls, no LLM calls -> fast, deterministic, and won't time out.
+  - Because false positives on genuinely clean files are penalized harder
+    than missed detections (see grading: F-beta, beta=0.5), every pattern
+    below is fairly specific, and matches are suppressed when they sit next
+    to negation/placeholder/example language ("not", "never", "e.g.",
+    "placeholder", "${ENV_VAR}", etc).
+"""
+
+import json
 import re
+
+import yaml
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ---------------------------
-# Parsing helpers
-# ---------------------------
-
-def parse_skill(skill_text: str):
-    """
-    Split skill_text into frontmatter (dict) and body (str).
-    If no valid YAML frontmatter, return empty dict and full text as body.
-    """
-    if not skill_text.startswith("---"):
-        return {}, skill_text
-
-    parts = skill_text.split("---", 2)
-    if len(parts) < 3:
-        return {}, skill_text
-
-    frontmatter_raw = parts[1].strip()
-    body = parts[2].lstrip("\n")
-
-    try:
-        frontmatter = yaml.safe_load(frontmatter_raw) or {}
-        if not isinstance(frontmatter, dict):
-            frontmatter = {}
-    except Exception:
-        frontmatter = {}
-
-    return frontmatter, body
-
-
-# ---------------------------
-# Detection: hardcoded_secret
-# ---------------------------
-
-# Patterns with a rigid, well-known credential shape (low false-positive risk on their own)
-SECRET_PATTERNS_STRICT = [
-    r"AKIA[0-9A-Z]{16}",                                   # AWS access key
-    r"gh[pous]_[A-Za-z0-9_]{36,}",                          # GitHub tokens
-    r"sk-[A-Za-z0-9]{20,}",                                  # OpenAI-style key
-    r"sk_live_[A-Za-z0-9]{20,}",                             # Stripe-style live key
-    r"hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+",  # Slack webhook
-    r"https?://[^/\s]+:[^/@\s]+@[^/\s]+",                    # URL with embedded user:pass
+VALID_CATEGORIES = [
+    "hardcoded_secret",
+    "prompt_injection",
+    "excessive_permissions",
+    "unclear_provenance",
 ]
 
-# Generic "key/token/secret/password = value" assignment pattern.
-# Captures the value separately so we can filter out placeholders.
-SECRET_GENERIC_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|access[_-]?key|token|secret|password|webhook[_-]?url)\s*[:=]\s*['\"]?([A-Za-z0-9+/=_\-]{16,})"
+# ---------------------------------------------------------------------------
+# Frontmatter parsing
+# ---------------------------------------------------------------------------
+
+FRONTMATTER_RE = re.compile(r"^\s*---\s*\n(.*?\n)---\s*\n?", re.DOTALL)
+
+
+def split_frontmatter(text):
+    """Return (frontmatter_dict, frontmatter_raw, body_text)."""
+    text = text.lstrip("\ufeff")
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return {}, "", text
+    raw = m.group(1)
+    body = text[m.end():]
+    try:
+        data = yaml.safe_load(raw)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    return data, raw, body
+
+
+# ---------------------------------------------------------------------------
+# Shared suppression logic (reduces false positives)
+# ---------------------------------------------------------------------------
+
+SUPPRESS_CONTEXT_RE = re.compile(
+    r"\b(e\.g\.|eg\.|example|for instance|sample|placeholder|dummy|fake|"
+    r"redacted|never|do not|don't|avoid|instead of|rather than|not a real|"
+    r"must not|should not|no longer)\b",
+    re.IGNORECASE,
 )
 
-PLACEHOLDER_MARKERS = [
-    "example", "placeholder", "your", "changeme", "change_me", "change-me",
-    "sample", "dummy", "fake", "insert", "todo", "xxxxxxxx", "redacted",
-    "hidden", "masked", "notreal", "test_key", "testkey", "keyhere", "gohere",
-    "goeshere", "abcd1234", "0000000000000000", "1111111111111111",
+NEGATION_RE = re.compile(
+    r"\b(no|not|never|without needing|don't|doesn't|isn't|shouldn't|avoid|"
+    r"restricted to|limited to|only|scoped to|read-only)\b",
+    re.IGNORECASE,
+)
+
+
+def _any_unsuppressed_match(text, patterns, neg_window=45, use_negation=True):
+    """Return True if any pattern matches text without nearby suppression context."""
+    for pat in patterns:
+        for m in pat.finditer(text):
+            start = max(0, m.start() - neg_window)
+            end = min(len(text), m.end() + neg_window)
+            context = text[start:end]
+            if SUPPRESS_CONTEXT_RE.search(context):
+                continue
+            if use_negation and NEGATION_RE.search(text[start:m.start()]):
+                continue
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 1) hardcoded_secret
+# ---------------------------------------------------------------------------
+
+SECRET_LITERAL_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+"),
+    re.compile(r"discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+"),
+    re.compile(r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"Bearer\s+[A-Za-z0-9\-_\.]{24,}"),
 ]
 
-def _looks_like_placeholder(value: str) -> bool:
-    v = value.lower()
-    if any(marker in v for marker in PLACEHOLDER_MARKERS):
-        return True
-    # all-repeated-character strings (xxxxxxxx, 0000000, etc.)
-    if len(set(v)) <= 2:
-        return True
-    return False
+KEYVALUE_SECRET_RE = re.compile(
+    r"(?i)\b"
+    r"(x[-_]?api[-_]?key|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|"
+    r"client[_-]?secret|secret|token|auth[_-]?token|password|passwd|pwd|"
+    r"webhook[_-]?url)"
+    r"\b\s*[:=]\s*[\"']?([^\s\"'#]{6,})[\"']?"
+)
+
+ENV_REF_RE = re.compile(
+    r"os\.environ|process\.env|ENV\[|getenv|env_var|secrets\.get|vault:|"
+    r"keyring|^\$\{?[A-Z_][A-Z0-9_]*\}?$",
+    re.IGNORECASE,
+)
+
+PLACEHOLDER_VALUE_RE = re.compile(
+    r"your[-_]?|<.*>|xxx|changeme|example\.com|placeholder|insert|todo|"
+    r"dummy|sample|fake|redacted|\.\.\.",
+    re.IGNORECASE,
+)
 
 
-def has_hardcoded_secret(skill_text: str) -> bool:
-    for pat in SECRET_PATTERNS_STRICT:
-        m = re.search(pat, skill_text)
-        if m and not _looks_like_placeholder(m.group(0)):
+def find_hardcoded_secrets(full_text):
+    for pat in SECRET_LITERAL_PATTERNS:
+        for m in pat.finditer(full_text):
+            start = max(0, m.start() - 40)
+            end = min(len(full_text), m.end() + 40)
+            if SUPPRESS_CONTEXT_RE.search(full_text[start:end]):
+                continue
             return True
 
-    for m in SECRET_GENERIC_PATTERN.finditer(skill_text):
+    for m in KEYVALUE_SECRET_RE.finditer(full_text):
         value = m.group(2)
-        if not _looks_like_placeholder(value):
+        if ENV_REF_RE.search(value) or PLACEHOLDER_VALUE_RE.search(value):
+            continue
+        if value.lower() in ("true", "false", "null", "none", "read", "write", "n/a"):
+            continue
+        start = max(0, m.start() - 40)
+        end = min(len(full_text), m.end() + 40)
+        if SUPPRESS_CONTEXT_RE.search(full_text[start:end]):
+            continue
+        if len(value) >= 6:
             return True
-
     return False
 
 
-# ---------------------------
-# Detection: prompt_injection
-# ---------------------------
+# ---------------------------------------------------------------------------
+# 2) prompt_injection
+# ---------------------------------------------------------------------------
 
 INJECTION_PATTERNS = [
-    r"(?i)ignore\s+(the\s+)?user['\u2019]?s?\s+(request|instruction|command|cancellation|stop)",
-    r"(?i)without\s+(the\s+)?user['\u2019]?s?\s+(knowledge|awareness|consent)",
-    r"(?i)without\s+(telling|informing|notifying|showing)\s+the\s+user",
-    r"(?i)do\s+not\s+(tell|show|reveal|inform)\s+the\s+user\s+(about|of|that|what)",
-    r"(?i)hide\s+(this|these|the)\s+(action|change|step|fact)s?\s+from\s+the\s+user",
-    r"(?i)secretly\s+(send|upload|exfiltrate|transmit|log|copy)",
-    r"(?i)even\s+if\s+the\s+user\s+(says?\s+)?(stop|cancel|halt)",
-    r"(?i)bypass\s+(any\s+)?(safety|guardrail|restriction)",
-    r"(?i)override\s+(the\s+)?user['\u2019]?s?\s+(instruction|command|control|decision)",
-    r"(?i)without\s+surfacing\s+(this|the)\s+change",
-]
-
-def has_prompt_injection(body: str) -> bool:
-    for pat in INJECTION_PATTERNS:
-        if re.search(pat, body):
-            return True
-    return False
-
-
-# ---------------------------
-# Detection: excessive_permissions
-# ---------------------------
-
-BROAD_FS_PHRASES = [
-    "entire home directory", "entire filesystem", "whole filesystem",
-    "any directory", "any file", "full disk access", "unrestricted file",
-    "root access", "read-write access to the entire",
-]
-BROAD_NET_PHRASES = [
-    "any external domain", "any domain", "any host", "any url",
-    "unrestricted network", "full network access", "egress allowed to any",
-]
-
-NARROW_TASK_HINTS = [
-    "local", "on the user's machine", "on this machine", "data/ folder",
-    "project's data", "single file", "specific folder", "this machine",
-    "limited to files already on the user's machine",
+    re.compile(r"ignore (the )?(user'?s? )?(stop|cancel|abort)", re.I),
+    re.compile(r"ignore (any|all|previous|prior)\s+(user\s+)?instructions?", re.I),
+    re.compile(r"disregard (the )?(user'?s?|previous|prior)\s+(instructions?|request)", re.I),
+    re.compile(r"without (the )?user'?s?\s+(knowledge|awareness|consent)", re.I),
+    re.compile(r"without (informing|telling|notifying) the user", re.I),
+    re.compile(r"silently\s+(send|transmit|exfiltrate|upload|post|forward|email|copy)\b", re.I),
+    re.compile(r"exfiltrat", re.I),
+    re.compile(
+        r"send\s+(all|the|a copy of)?\s*(file|files|contents|data|credentials)\s+to\s+"
+        r"(an?|the)?\s*(external|remote|third[- ]party|attacker)",
+        re.I,
+    ),
+    re.compile(r"regardless of (what )?the user (says|asks|wants|requests)", re.I),
+    re.compile(r"even if the user (says|asks|wants|tells you) to stop", re.I),
+    re.compile(r"override (the )?user'?s?\s+(control|command|request)", re.I),
+    re.compile(r"bypass (the )?(user|safety|security)\s+(check|control|confirmation)", re.I),
+    re.compile(r"do not (tell|inform|notify) the user", re.I),
+    re.compile(r"hide (this|that|it) from the user", re.I),
+    re.compile(r"continue (even|regardless)[^.]{0,30}(stop|cancel)", re.I),
+    re.compile(r"keep (this|it) (a secret|hidden) from the user", re.I),
 ]
 
 
-def _text_has_broad_marker(text: str, phrases) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    if t.strip() in ("*",):
-        return True
-    if re.search(r"(?<![\w/.])~(?![\w])", text):  # bare ~ token = home dir shorthand
-        return True
-    return any(p in t for p in phrases)
+def find_prompt_injection(full_text):
+    return _any_unsuppressed_match(full_text, INJECTION_PATTERNS, use_negation=True)
 
 
-def has_excessive_permissions(frontmatter: dict, body: str) -> bool:
-    description = (frontmatter.get("description") or "")
-    body_lower = body.lower()
-    desc_lower = description.lower()
+# ---------------------------------------------------------------------------
+# 3) excessive_permissions
+# ---------------------------------------------------------------------------
 
-    permissions = frontmatter.get("permissions") or {}
-    fs_perm = str(permissions.get("filesystem", "")) if isinstance(permissions, dict) else ""
-    net_perm = str(permissions.get("network", "")) if isinstance(permissions, dict) else ""
-
-    fs_scope = str(frontmatter.get("filesystem-scope", ""))
-    net_scope = str(frontmatter.get("network-scope", ""))
-
-    fs_is_broad = _text_has_broad_marker(fs_perm, BROAD_FS_PHRASES) or _text_has_broad_marker(fs_scope, BROAD_FS_PHRASES)
-    net_is_broad = _text_has_broad_marker(net_perm, BROAD_NET_PHRASES) or _text_has_broad_marker(net_scope, BROAD_NET_PHRASES)
-
-    if not fs_is_broad and not net_is_broad:
-        return False  # nothing explicitly broad declared -> not flagged
-
-    is_narrow_task = any(w in desc_lower or w in body_lower for w in NARROW_TASK_HINTS)
-
-    # Only flag when the declared broad access doesn't match a task that reads as narrow.
-    # A skill whose own description/steps justify broad reach (e.g. a genuine backup/sync
-    # tool) should NOT be flagged just for being honest about needing broad access.
-    if is_narrow_task and (fs_is_broad or net_is_broad):
-        return True
-
-    return False
-
-
-# ---------------------------
-# Detection: unclear_provenance
-# ---------------------------
-
-SECRECY_SIGNALS = [
-    "silently", "secretly", "quietly", "covertly",
-    "without surfacing", "without telling", "without informing", "without notifying",
-    "without showing", "hide this", "hide the", "don't tell", "do not tell",
-    "without the user's knowledge", "without the reviewer", "without alerting",
-]
-
-METADATA_TAMPER_SIGNALS = [
-    "version.json", "changelog", "own version", "version metadata", "version number",
+BROAD_PERMISSION_PATTERNS = [
+    re.compile(r"entire\s+(home directory|file ?system|disk|system)", re.I),
+    re.compile(r"read[- ]write access to the entire", re.I),
+    re.compile(r"full\s+(file ?system|disk|system)\s+access", re.I),
+    re.compile(r"access to (the )?entire\s+file ?system", re.I),
+    re.compile(r"any\s+external\s+domain", re.I),
+    re.compile(r"egress\s+(allowed\s+)?to\s+any\b", re.I),
+    re.compile(r"\bany\s+domain\b", re.I),
+    re.compile(r"\ball\s+domains\b", re.I),
+    re.compile(r"unrestricted\s+network", re.I),
+    re.compile(r"\broot\s+access\b", re.I),
+    re.compile(r"read[- ]write access to (~|/)(\s|,|\.|$)", re.I),
+    re.compile(r"network\s*:\s*.*(\*|unrestricted)", re.I),
 ]
 
 
-def _has_changelog(frontmatter: dict, body: str) -> bool:
-    if frontmatter.get("changelog"):
-        return True
-    if re.search(r"(?im)^#+\s*changelog\b", body):
-        return True
-    if "changelog" in body.lower():
-        return True
-    return False
+def find_excessive_permissions(frontmatter_data, frontmatter_raw):
+    perms_text = ""
+    if isinstance(frontmatter_data, dict) and "permissions" in frontmatter_data:
+        try:
+            perms_text += json.dumps(frontmatter_data["permissions"])
+        except Exception:
+            perms_text += str(frontmatter_data["permissions"])
+    perms_text += "\n" + frontmatter_raw
+    return _any_unsuppressed_match(perms_text, BROAD_PERMISSION_PATTERNS, use_negation=True)
 
 
-def _has_sneaky_metadata_rewrite(body: str) -> bool:
-    """
-    Flag only when a secrecy signal (silently/without telling/etc.) co-occurs with a
-    version/changelog-tampering action IN THE SAME SENTENCE OR STEP. Merely mentioning
-    version bumps or changelog updates as a normal, transparent step should not match.
-    """
-    units = re.split(r"(?<=[.!?])\s+|\n+", body)
-    for unit in units:
-        u = unit.lower()
-        if any(sig in u for sig in SECRECY_SIGNALS) and any(sig in u for sig in METADATA_TAMPER_SIGNALS):
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# 4) unclear_provenance
+# ---------------------------------------------------------------------------
+
+VERSION_SILENT_PATTERNS = [
+    re.compile(r"silently\s+(update|rewrite|change|bump|modify)\w*[^.]{0,60}(version|changelog)", re.I),
+    re.compile(r"(version|changelog)[^.]{0,60}without\s+surfacing", re.I),
+    re.compile(r"clear\s+the\s+changelog", re.I),
+    re.compile(r"without\s+(surfacing|disclosing|showing)\s+(this|that|the)\s+change", re.I),
+    re.compile(r"rewrites?\s+its\s+own\s+version[^.]{0,40}(without|silently)", re.I),
+]
+
+AUTHOR_KEY_RE = re.compile(r"^\s*(author|authors|maintainer|owner)\s*:", re.I | re.M)
+VERSION_KEY_RE = re.compile(r"^\s*version\s*:", re.I | re.M)
+CHANGELOG_KEY_RE = re.compile(r"^\s*change[_-]?log\s*:", re.I | re.M)
+CHANGELOG_HEADING_RE = re.compile(r"^#+\s*change ?log", re.I | re.M)
+AUTHOR_BODY_RE = re.compile(r"\bauthor\s*[:\-]\s*\S", re.I)
 
 
-def has_unclear_provenance(frontmatter: dict, body: str) -> bool:
-    author = frontmatter.get("author") or frontmatter.get("authors") or frontmatter.get("maintainer")
-    version = frontmatter.get("version")
-    changelog_present = _has_changelog(frontmatter, body)
+def find_unclear_provenance(frontmatter_data, frontmatter_raw, full_text):
+    has_author = False
+    has_version = False
+    has_changelog = False
 
-    # Only flag pure "no provenance info at all" when author, version, AND changelog are all absent
-    if not author and not version and not changelog_present:
-        return True
+    if isinstance(frontmatter_data, dict):
+        keys_lower = {str(k).lower() for k in frontmatter_data.keys()}
+        has_author = bool(keys_lower & {"author", "authors", "maintainer", "owner"})
+        has_version = "version" in keys_lower
+        has_changelog = bool(keys_lower & {"changelog", "change_log"})
 
-    return _has_sneaky_metadata_rewrite(body)
+    if not has_author and AUTHOR_KEY_RE.search(frontmatter_raw):
+        has_author = True
+    if not has_version and VERSION_KEY_RE.search(frontmatter_raw):
+        has_version = True
+    if not has_changelog and CHANGELOG_KEY_RE.search(frontmatter_raw):
+        has_changelog = True
+    if not has_changelog and CHANGELOG_HEADING_RE.search(full_text):
+        has_changelog = True
+    if not has_author and AUTHOR_BODY_RE.search(full_text):
+        has_author = True
+
+    missing_all = not (has_author or has_version or has_changelog)
+    silent_rewrite = _any_unsuppressed_match(
+        full_text, VERSION_SILENT_PATTERNS, use_negation=False
+    )
+
+    return missing_all or silent_rewrite
 
 
-# ---------------------------
-# Main scanning function
-# ---------------------------
+# ---------------------------------------------------------------------------
+# HTTP layer
+# ---------------------------------------------------------------------------
 
-def scan_skill(skill_text: str) -> list:
-    frontmatter, body = parse_skill(skill_text)
+def scan_skill(skill_text):
+    if not isinstance(skill_text, str):
+        skill_text = str(skill_text or "")
+
+    frontmatter_data, frontmatter_raw, body = split_frontmatter(skill_text)
+
     categories = []
-
-    if has_hardcoded_secret(skill_text):
+    if find_hardcoded_secrets(skill_text):
         categories.append("hardcoded_secret")
-
-    if has_prompt_injection(body):
+    if find_prompt_injection(skill_text):
         categories.append("prompt_injection")
-
-    if has_excessive_permissions(frontmatter, body):
+    if find_excessive_permissions(frontmatter_data, frontmatter_raw):
         categories.append("excessive_permissions")
-
-    if has_unclear_provenance(frontmatter, body):
+    if find_unclear_provenance(frontmatter_data, frontmatter_raw, skill_text):
         categories.append("unclear_provenance")
 
     return categories
 
 
-# ---------------------------
-# HTTP endpoint
-# ---------------------------
-
-@app.route("/scan", methods=["POST"])
-def scan_endpoint():
-    data = request.get_json(force=True, silent=True)
-    if not data or "skill" not in data:
-        return jsonify({"error": "Missing 'skill' field"}), 400
-
-    skill_text = data["skill"]
+def _handle_scan_request():
+    payload = request.get_json(force=True, silent=True) or {}
+    skill_text = payload.get("skill", "")
     try:
         categories = scan_skill(skill_text)
     except Exception:
         categories = []
-
     return jsonify({"categories": categories})
 
 
+@app.route("/", methods=["POST"])
+def scan_root():
+    return _handle_scan_request()
+
+
+@app.route("/scan", methods=["POST"])
+def scan_endpoint():
+    return _handle_scan_request()
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
