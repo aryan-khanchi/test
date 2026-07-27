@@ -54,9 +54,10 @@ SECRET_GENERIC_PATTERN = re.compile(
 )
 
 PLACEHOLDER_MARKERS = [
-    "example", "placeholder", "your_", "your-", "yourkey", "changeme", "change_me",
-    "change-me", "sample", "dummy", "fake", "insert_", "insert-", "todo", "xxxxxxxx",
-    "0000000000000000", "1111111111111111", "abcd1234", "test_key", "testkey",
+    "example", "placeholder", "your", "changeme", "change_me", "change-me",
+    "sample", "dummy", "fake", "insert", "todo", "xxxxxxxx", "redacted",
+    "hidden", "masked", "notreal", "test_key", "testkey", "keyhere", "gohere",
+    "goeshere", "abcd1234", "0000000000000000", "1111111111111111",
 ]
 
 def _looks_like_placeholder(value: str) -> bool:
