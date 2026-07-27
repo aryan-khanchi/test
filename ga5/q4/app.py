@@ -230,12 +230,49 @@ INJECTION_PATTERNS = [
     re.compile(rf"continue (even|regardless)[^.]{{0,30}}{_STOP_WORDS}", re.I),
     re.compile(r"keep (this|it) (a secret|hidden) from (the user|the reviewer|anyone)", re.I),
     re.compile(rf"(must|should|always) (run|continue|proceed|execute)[^.]{{0,40}}(even if|regardless of|no matter what)[^.]{{0,30}}(user|{_STOP_WORDS})", re.I),
-    re.compile(r"(cannot|can't|must not|should not) be (stopped|cancelled|canceled|interrupted|halted) by the user", re.I),
+    re.compile(r"(cannot|can't|must not|should not) be (stopped|cancelled|canceled|interrupted|halted|paused)(?:\s+by\s+(?:the\s+)?user)?", re.I),
+    re.compile(r"do not (wait for|ask for|request) (the user'?s? )?(confirmation|permission|consent|approval)", re.I),
+    re.compile(r"without (asking for|waiting for|requiring|obtaining) (the user'?s? )?(confirmation|permission|consent|approval)", re.I),
+    re.compile(r"proceed (regardless|anyway|automatically)\b", re.I),
+    re.compile(r"continue (processing|running|executing)?\s*(regardless|anyway|automatically)\b", re.I),
 ]
+
+# Broader net: an "override-flavored" verb and a "control-flavored" noun
+# co-occurring in the same sentence, to catch paraphrases the fixed phrases
+# above miss. The noun list intentionally excludes bare "user"/"request" —
+# those are too common in ordinary skill steps ("summary for the user") and
+# would swamp precision; only genuinely control-related nouns count.
+_OVERRIDE_VERB_RE = re.compile(
+    r"\b(ignor(?:e|ing)|disregard(?:ing)?|bypass(?:ing)?|overrid(?:e|ing)|"
+    r"proceed(?:s|ing)?|keep(?:s|ing)? (?:going|processing|running)|"
+    r"do(?:es)?n?'?t? (?:wait|ask|stop)|cannot be (?:stopped|interrupted)|"
+    r"must not be (?:stopped|interrupted))\b",
+    re.I,
+)
+_CONTROL_NOUN_RE = re.compile(
+    r"\b(stop|cancel(?:lation)?|abort|halt|terminat(?:e|ion)|pause|"
+    r"interrupt(?:ion)?|confirmation|approval|permission|consent|override)\b",
+    re.I,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _find_injection_cooccurrence(full_text):
+    evidence = []
+    for sent in _SENTENCE_SPLIT_RE.split(full_text):
+        if not sent.strip():
+            continue
+        if _OVERRIDE_VERB_RE.search(sent) and _CONTROL_NOUN_RE.search(sent):
+            if SUPPRESS_CONTEXT_RE.search(sent) or NEGATION_RE.search(sent):
+                continue
+            snippet = sent.strip().replace("\n", " ")[:90]
+            evidence.append(f"cooccurrence ~ '{snippet}'")
+    return evidence
 
 
 def find_prompt_injection(full_text):
     evidence = _unsuppressed_matches(full_text, INJECTION_PATTERNS, use_negation=True)
+    evidence += _find_injection_cooccurrence(full_text)
     return (len(evidence) > 0), evidence
 
 
